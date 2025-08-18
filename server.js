@@ -19,7 +19,7 @@ const PUSH_TO_ADMISSIONS = String(process.env.PUSH_TO_ADMISSIONS).toLowerCase() 
 const UPLOADED_LEADS_URL = process.env.UPLOADED_LEADS_URL;
 const LEAD_STATUS_URL = process.env.LEAD_STATUS_URL;
 const ADMISSIONS_TOKEN = process.env.ADMISSIONS_TOKEN;
-const SOURCE_API = process.env.SOURCE_API; // POST endpoint for uploadedLeads
+const SOURCE_API = process.env.SOURCE_API;
 
 // ensure tmp dir
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -60,11 +60,20 @@ async function downloadToTmp(url) {
   fs.writeFileSync(dest, resp.data);
   return dest;
 }
+
+// ✨ Improved preprocessing for handwriting
 async function preprocess(srcPath) {
   const outPath = srcPath.replace(/\.[^.]+$/, "") + "_proc.png";
-  await sharp(srcPath).rotate().grayscale().sharpen().toFormat("png").toFile(outPath);
+  await sharp(srcPath)
+    .resize({ width: 2000 })     // upscale for better recognition
+    .grayscale()
+    .normalize()                 // enhance contrast
+    .threshold(180)              // binarize (important for handwriting)
+    .toFormat("png")
+    .toFile(outPath);
   return outPath;
 }
+
 function titleCase(s) {
   if (!s) return "";
   return s.toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase()).trim();
@@ -72,28 +81,62 @@ function titleCase(s) {
 function digitsOnly(s) {
   return (s || "").replace(/\D/g, "");
 }
+
+// Flexible "after" matcher
 function after(text, labelRegex, valueRegex = /([^\n\r]+)/) {
-  const m = text.match(new RegExp(labelRegex.source + "\\s*" + valueRegex.source, "i"));
+  const m = text.match(
+    new RegExp(labelRegex.source + "[\\s:]*" + valueRegex.source, "i")
+  );
   return m ? (m[1] || "").trim() : "";
 }
+
+// ✨ Improved parser for handwritten forms
 function parseStudentForm(raw) {
   const text = raw.replace(/[|]+/g, " ").replace(/\u200b/g, "").replace(/\r/g, "");
+
   const data = {};
-  data.first_name = titleCase(after(text, /First\s*Name[:.]?/i));
-  data.last_name = titleCase(after(text, /Last\s*Name[:.]?/i));
-  let mobile = digitsOnly(after(text, /Mobile\s*No[:.]?/i, /([0-9\s\-()+]{7,20})/));
+
+  // Names
+  data.first_name = titleCase(after(text, /(First\s*Name|Frst\s*Name)[:.]?/i));
+  data.last_name = titleCase(after(text, /(Last\s*Name|Lst\s*Name)[:.]?/i));
+
+  // Mobile
+  let mobile = digitsOnly(
+    after(text, /(Mobile\s*No|Mob\s*No)[:.]?/i, /([0-9\s\-()+]{7,20})/)
+  );
   if (mobile.startsWith("91") && mobile.length > 10) mobile = mobile.slice(-10);
   data.mobile_no = mobile;
-  data.email = (after(text, /Email\s*ID[:.]?/i, /([\w.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/) || "").toLowerCase();
-  data.school_college_name = after(text, /School.*?Name[:.]?/i);
-  data.current_grade = after(text, /Current\s*Grade[:.]?/i);
-  data.completion_year = after(text, /Completion\s*Year[:.]?/i);
+
+  // Email
+  data.email = (
+    after(
+      text,
+      /(Email\s*ID|E[-\s]?mail)[:.]?/i,
+      /([\w.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/
+    ) || ""
+  ).toLowerCase();
+
+  // School / College
+  data.school_college_name = after(text, /(School|College)\s*Name[:.]?/i);
+
+  // Current Grade
+  data.current_grade = after(text, /(Current\s*Grade|Grade)[:.]?/i);
+
+  // Completion Year (fuzzy)
+  data.completion_year = after(text, /(Completion|Comp1etion|Complition)\s*Year[:.]?/i);
+
+  // Parents
   data.father_name = titleCase(after(text, /Father'?s\s*Name[:.]?/i));
   data.mother_name = titleCase(after(text, /Mother'?s\s*Name[:.]?/i));
+
+  // Program Interested
   if (/Entrepreneurship|BBA/i.test(text)) data.program_interested_in = "BBA";
   else if (/Design|B\.?Des/i.test(text)) data.program_interested_in = "B.Des";
   else if (/Digital\s*Technology|AI|ML/i.test(text)) data.program_interested_in = "B.Sc AI & ML";
+
+  // Comments
   data.comments = after(text, /Comments?[:.]?/i);
+
   return data;
 }
 
@@ -125,7 +168,9 @@ async function pushLeadStatusUpdate(lead_id, parsed) {
 async function processFormFromUrl(s3_url) {
   const imgPath = await downloadToTmp(s3_url);
   const procPath = await preprocess(imgPath);
+
   const { data: { text } } = await worker.recognize(procPath);
+
   fs.unlink(imgPath, () => {});
   fs.unlink(procPath, () => {});
 
@@ -167,15 +212,14 @@ app.post("/ocr", async (req, res) => {
   }
 });
 
-// ---------- API: auto import from SOURCE_API ----------
+// ---------- API: auto import ----------
 app.get("/auto-import", async (req, res) => {
   try {
     if (!SOURCE_API) return res.status(400).json({ error: "SOURCE_API not set" });
 
-    // 🔹 POST request to SOURCE_API with auth
     const { data: forms } = await axios.post(
       SOURCE_API,
-      { status: "new" }, // adjust body if needed
+      { status: "new" },
       {
         headers: {
           Authorization: `Bearer ${ADMISSIONS_TOKEN}`,
@@ -185,7 +229,6 @@ app.get("/auto-import", async (req, res) => {
     );
 
     const results = [];
-    // Adjust if response is wrapped in { data: [] }
     const leads = Array.isArray(forms) ? forms : forms.data || [];
     for (const f of leads) {
       if (f.s3_url) {
