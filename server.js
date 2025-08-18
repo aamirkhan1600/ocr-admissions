@@ -6,20 +6,20 @@ const helmet = require("helmet");
 const cors = require("cors");
 const axios = require("axios");
 const mysql = require("mysql2/promise");
+const sharp = require("sharp");
+const { createWorker } = require("tesseract.js");
 const cron = require("node-cron");
-const { OpenAI } = require("openai");
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 3000;
 const TMP_DIR = process.env.TMP_DIR || "tmp";
+const LANGS = (process.env.LANGS || "eng").split(",");
 const PUSH_TO_ADMISSIONS = String(process.env.PUSH_TO_ADMISSIONS).toLowerCase() === "true";
 
 const UPLOADED_LEADS_URL = process.env.UPLOADED_LEADS_URL;
 const LEAD_STATUS_URL = process.env.LEAD_STATUS_URL;
 const ADMISSIONS_TOKEN = process.env.ADMISSIONS_TOKEN;
-const SOURCE_API = process.env.SOURCE_API;
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const SOURCE_API = process.env.SOURCE_API; // POST endpoint for uploadedLeads
 
 // ensure tmp dir
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -28,7 +28,7 @@ if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 const app = express();
 app.use(helmet());
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.get("/health", (_, res) => res.send("OK"));
 
 // ---------- DB ----------
@@ -41,6 +41,16 @@ const pool = mysql.createPool({
   connectionLimit: 10,
 });
 
+// ---------- OCR Worker ----------
+let worker;
+async function initWorker() {
+  worker = await createWorker(LANGS.join("+"));
+  await worker.setParameters({
+    tessedit_char_whitelist:
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@._-+&:/()'\", ",
+  });
+}
+
 // ---------- Helpers ----------
 async function downloadToTmp(url) {
   const id = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -50,36 +60,44 @@ async function downloadToTmp(url) {
   fs.writeFileSync(dest, resp.data);
   return dest;
 }
-
-async function extractTextWithAI(imagePath) {
-  const imageData = fs.readFileSync(imagePath);
-  const response = await openai.responses.create({
-    model: "gpt-4o-mini-vision",
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: `
-Extract all text from this handwritten student form and return JSON with keys:
-first_name, last_name, mobile_no, email, school_college_name, current_grade,
-completion_year, father_name, mother_name, program_interested_in, comments
-`
-          },
-          {
-            type: "input_file",
-            file: imageData,
-            filename: path.basename(imagePath)
-          }
-        ]
-      }
-    ]
-  });
-
-  return response.output_text;
+async function preprocess(srcPath) {
+  const outPath = srcPath.replace(/\.[^.]+$/, "") + "_proc.png";
+  await sharp(srcPath).rotate().grayscale().sharpen().toFormat("png").toFile(outPath);
+  return outPath;
+}
+function titleCase(s) {
+  if (!s) return "";
+  return s.toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase()).trim();
+}
+function digitsOnly(s) {
+  return (s || "").replace(/\D/g, "");
+}
+function after(text, labelRegex, valueRegex = /([^\n\r]+)/) {
+  const m = text.match(new RegExp(labelRegex.source + "\\s*" + valueRegex.source, "i"));
+  return m ? (m[1] || "").trim() : "";
+}
+function parseStudentForm(raw) {
+  const text = raw.replace(/[|]+/g, " ").replace(/\u200b/g, "").replace(/\r/g, "");
+  const data = {};
+  data.first_name = titleCase(after(text, /First\s*Name[:.]?/i));
+  data.last_name = titleCase(after(text, /Last\s*Name[:.]?/i));
+  let mobile = digitsOnly(after(text, /Mobile\s*No[:.]?/i, /([0-9\s\-()+]{7,20})/));
+  if (mobile.startsWith("91") && mobile.length > 10) mobile = mobile.slice(-10);
+  data.mobile_no = mobile;
+  data.email = (after(text, /Email\s*ID[:.]?/i, /([\w.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/) || "").toLowerCase();
+  data.school_college_name = after(text, /School.*?Name[:.]?/i);
+  data.current_grade = after(text, /Current\s*Grade[:.]?/i);
+  data.completion_year = after(text, /Completion\s*Year[:.]?/i);
+  data.father_name = titleCase(after(text, /Father'?s\s*Name[:.]?/i));
+  data.mother_name = titleCase(after(text, /Mother'?s\s*Name[:.]?/i));
+  if (/Entrepreneurship|BBA/i.test(text)) data.program_interested_in = "BBA";
+  else if (/Design|B\.?Des/i.test(text)) data.program_interested_in = "B.Des";
+  else if (/Digital\s*Technology|AI|ML/i.test(text)) data.program_interested_in = "B.Sc AI & ML";
+  data.comments = after(text, /Comments?[:.]?/i);
+  return data;
 }
 
+// ---------- Admissions API pushers ----------
 async function pushUploadedLeads(payload) {
   if (!PUSH_TO_ADMISSIONS || !UPLOADED_LEADS_URL || !ADMISSIONS_TOKEN) return null;
   const res = await axios.post(UPLOADED_LEADS_URL, payload, {
@@ -87,7 +105,6 @@ async function pushUploadedLeads(payload) {
   });
   return res.data;
 }
-
 async function pushLeadStatusUpdate(lead_id, parsed) {
   if (!PUSH_TO_ADMISSIONS || !LEAD_STATUS_URL || !ADMISSIONS_TOKEN) return null;
   const body = {
@@ -107,38 +124,25 @@ async function pushLeadStatusUpdate(lead_id, parsed) {
 // ---------- Core processor ----------
 async function processFormFromUrl(s3_url) {
   const imgPath = await downloadToTmp(s3_url);
+  const procPath = await preprocess(imgPath);
+  const { data: { text } } = await worker.recognize(procPath);
+  fs.unlink(imgPath, () => {});
+  fs.unlink(procPath, () => {});
 
-  let text;
-  try {
-    text = await extractTextWithAI(imgPath);
-  } catch (err) {
-    fs.unlinkSync(imgPath);
-    throw err;
-  }
-
-  fs.unlinkSync(imgPath);
-
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    parsed = { raw_text: text }; // fallback if AI did not return valid JSON
-  }
+  const parsed = parseStudentForm(text);
   parsed.image_url = s3_url;
 
   const sql = `INSERT INTO student_forms 
     (image_url, first_name, last_name, mobile_no, email, school_college_name, current_grade,
     completion_year, father_name, mother_name, program_interested_in, comments, raw_text)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-
   const vals = [
     parsed.image_url,
-    parsed.first_name || null, parsed.last_name || null, parsed.mobile_no || null, parsed.email || null,
-    parsed.school_college_name || null, parsed.current_grade || null, parsed.completion_year || null,
-    parsed.father_name || null, parsed.mother_name || null, parsed.program_interested_in || null,
-    parsed.comments || null, parsed.raw_text || text
+    parsed.first_name, parsed.last_name, parsed.mobile_no, parsed.email,
+    parsed.school_college_name, parsed.current_grade, parsed.completion_year,
+    parsed.father_name, parsed.mother_name, parsed.program_interested_in,
+    parsed.comments, text
   ];
-
   const [result] = await pool.execute(sql, vals);
 
   let uploaded = null, status = null;
@@ -168,13 +172,20 @@ app.get("/auto-import", async (req, res) => {
   try {
     if (!SOURCE_API) return res.status(400).json({ error: "SOURCE_API not set" });
 
+    // 🔹 POST request to SOURCE_API with auth
     const { data: forms } = await axios.post(
       SOURCE_API,
-      { status: "new" },
-      { headers: { Authorization: `Bearer ${ADMISSIONS_TOKEN}`, "Content-Type": "application/json" } }
+      { status: "new" }, // adjust body if needed
+      {
+        headers: {
+          Authorization: `Bearer ${ADMISSIONS_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
     );
 
     const results = [];
+    // Adjust if response is wrapped in { data: [] }
     const leads = Array.isArray(forms) ? forms : forms.data || [];
     for (const f of leads) {
       if (f.s3_url) {
@@ -197,7 +208,12 @@ cron.schedule("0 * * * *", async () => {
     const { data: forms } = await axios.post(
       SOURCE_API,
       { status: "new" },
-      { headers: { Authorization: `Bearer ${ADMISSIONS_TOKEN}`, "Content-Type": "application/json" } }
+      {
+        headers: {
+          Authorization: `Bearer ${ADMISSIONS_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
     );
     const leads = Array.isArray(forms) ? forms : forms.data || [];
     for (const f of leads) {
@@ -209,4 +225,7 @@ cron.schedule("0 * * * *", async () => {
 });
 
 // ---------- Boot ----------
-app.listen(PORT, () => console.log(`OCR Admissions API running on :${PORT}`));
+(async () => {
+  await initWorker();
+  app.listen(PORT, () => console.log(`OCR Admissions API automated listening on :${PORT}`));
+})();
