@@ -164,7 +164,7 @@ async function processFormFromUrl(s3_url) {
   parsed_profile.image_url = s3_url;
 
   // store in DB
-  const sql = `INSERT INTO student_forms 
+  const sql = `INSERT INTO student_forms_v2 
     (image_url, first_name, last_name, mobile_no, email, school_college_name, current_grade,
     completion_year, father_name, mother_name, program_interested_in, comments, raw_text, parsed_profile)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
