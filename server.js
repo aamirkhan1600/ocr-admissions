@@ -64,9 +64,9 @@ async function preprocess(srcPath) {
   const outPath = srcPath.replace(/\.[^.]+$/, "") + "_proc.png";
   await sharp(srcPath)
     .rotate()
-    .resize(1800, null, { withoutEnlargement: true }) // upscale if too small
+    .resize(1800, null, { withoutEnlargement: true }) // upscale small images
     .grayscale()
-    .normalise() // normalize contrast
+    .normalise()
     .sharpen()
     .toFormat("png")
     .toFile(outPath);
@@ -188,7 +188,7 @@ async function processFormFromUrl(s3_url) {
 
   return {
     local_id: result.insertId,
-    lead_data: parsed_profile,
+    parsed_profile,
     admissions_uploadedLeads: uploaded,
     admissions_leadStatusUpdate: status
   };
