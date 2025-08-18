@@ -19,7 +19,7 @@ const PUSH_TO_ADMISSIONS = String(process.env.PUSH_TO_ADMISSIONS).toLowerCase() 
 const UPLOADED_LEADS_URL = process.env.UPLOADED_LEADS_URL;
 const LEAD_STATUS_URL = process.env.LEAD_STATUS_URL;
 const ADMISSIONS_TOKEN = process.env.ADMISSIONS_TOKEN;
-const SOURCE_API = process.env.SOURCE_API; // POST endpoint for uploadedLeads
+const SOURCE_API = process.env.SOURCE_API;
 
 // ensure tmp dir
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -62,7 +62,14 @@ async function downloadToTmp(url) {
 }
 async function preprocess(srcPath) {
   const outPath = srcPath.replace(/\.[^.]+$/, "") + "_proc.png";
-  await sharp(srcPath).rotate().grayscale().sharpen().toFormat("png").toFile(outPath);
+  await sharp(srcPath)
+    .rotate()
+    .resize(1800, null, { withoutEnlargement: true }) // upscale if too small
+    .grayscale()
+    .normalise() // normalize contrast
+    .sharpen()
+    .toFormat("png")
+    .toFile(outPath);
   return outPath;
 }
 function titleCase(s) {
@@ -76,25 +83,47 @@ function after(text, labelRegex, valueRegex = /([^\n\r]+)/) {
   const m = text.match(new RegExp(labelRegex.source + "\\s*" + valueRegex.source, "i"));
   return m ? (m[1] || "").trim() : "";
 }
+
+// ---------- Parser ----------
 function parseStudentForm(raw) {
-  const text = raw.replace(/[|]+/g, " ").replace(/\u200b/g, "").replace(/\r/g, "");
-  const data = {};
-  data.first_name = titleCase(after(text, /First\s*Name[:.]?/i));
-  data.last_name = titleCase(after(text, /Last\s*Name[:.]?/i));
+  const text = raw
+    .replace(/[|]+/g, " ")
+    .replace(/\u200b/g, "")
+    .replace(/\r/g, "")
+    .replace(/[^\x20-\x7E\n\r]/g, ""); // strip weird chars
+
+  const parsed_profile = {};
+
+  parsed_profile.first_name = titleCase(after(text, /First\s*Name[:.]?/i));
+  parsed_profile.last_name = titleCase(after(text, /Last\s*Name[:.]?/i));
+
   let mobile = digitsOnly(after(text, /Mobile\s*No[:.]?/i, /([0-9\s\-()+]{7,20})/));
   if (mobile.startsWith("91") && mobile.length > 10) mobile = mobile.slice(-10);
-  data.mobile_no = mobile;
-  data.email = (after(text, /Email\s*ID[:.]?/i, /([\w.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/) || "").toLowerCase();
-  data.school_college_name = after(text, /School.*?Name[:.]?/i);
-  data.current_grade = after(text, /Current\s*Grade[:.]?/i);
-  data.completion_year = after(text, /Completion\s*Year[:.]?/i);
-  data.father_name = titleCase(after(text, /Father'?s\s*Name[:.]?/i));
-  data.mother_name = titleCase(after(text, /Mother'?s\s*Name[:.]?/i));
-  if (/Entrepreneurship|BBA/i.test(text)) data.program_interested_in = "BBA";
-  else if (/Design|B\.?Des/i.test(text)) data.program_interested_in = "B.Des";
-  else if (/Digital\s*Technology|AI|ML/i.test(text)) data.program_interested_in = "B.Sc AI & ML";
-  data.comments = after(text, /Comments?[:.]?/i);
-  return data;
+  parsed_profile.mobile_no = mobile;
+
+  parsed_profile.email =
+    (after(
+      text,
+      /Email\s*ID[:.]?/i,
+      /([\w.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/
+    ) || "").toLowerCase();
+
+  parsed_profile.school_college_name = after(text, /School.*?Name[:.]?/i);
+  parsed_profile.current_grade = after(text, /Current\s*Grade[:.]?/i);
+  parsed_profile.completion_year = after(text, /Completion\s*Year[:.]?/i);
+  parsed_profile.father_name = titleCase(after(text, /Father'?s\s*Name[:.]?/i));
+  parsed_profile.mother_name = titleCase(after(text, /Mother'?s\s*Name[:.]?/i));
+
+  if (/Entrepreneurship|BBA/i.test(text))
+    parsed_profile.program_interested_in = "BBA";
+  else if (/Design|B\.?Des/i.test(text))
+    parsed_profile.program_interested_in = "B.Des";
+  else if (/Digital\s*Technology|AI|ML/i.test(text))
+    parsed_profile.program_interested_in = "B.Sc AI & ML";
+
+  parsed_profile.comments = after(text, /Comments?[:.]?/i);
+
+  return { parsed_profile, raw_text: text };
 }
 
 // ---------- Admissions API pushers ----------
@@ -126,33 +155,43 @@ async function processFormFromUrl(s3_url) {
   const imgPath = await downloadToTmp(s3_url);
   const procPath = await preprocess(imgPath);
   const { data: { text } } = await worker.recognize(procPath);
+
+  // cleanup tmp files
   fs.unlink(imgPath, () => {});
   fs.unlink(procPath, () => {});
 
-  const parsed = parseStudentForm(text);
-  parsed.image_url = s3_url;
+  const { parsed_profile, raw_text } = parseStudentForm(text);
+  parsed_profile.image_url = s3_url;
 
+  // store in DB
   const sql = `INSERT INTO student_forms 
     (image_url, first_name, last_name, mobile_no, email, school_college_name, current_grade,
-    completion_year, father_name, mother_name, program_interested_in, comments, raw_text)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    completion_year, father_name, mother_name, program_interested_in, comments, raw_text, parsed_profile)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
   const vals = [
-    parsed.image_url,
-    parsed.first_name, parsed.last_name, parsed.mobile_no, parsed.email,
-    parsed.school_college_name, parsed.current_grade, parsed.completion_year,
-    parsed.father_name, parsed.mother_name, parsed.program_interested_in,
-    parsed.comments, text
+    parsed_profile.image_url,
+    parsed_profile.first_name, parsed_profile.last_name,
+    parsed_profile.mobile_no, parsed_profile.email,
+    parsed_profile.school_college_name, parsed_profile.current_grade, parsed_profile.completion_year,
+    parsed_profile.father_name, parsed_profile.mother_name, parsed_profile.program_interested_in,
+    parsed_profile.comments, raw_text, JSON.stringify(parsed_profile)
   ];
   const [result] = await pool.execute(sql, vals);
 
   let uploaded = null, status = null;
-  try { uploaded = await pushUploadedLeads(parsed); } catch {}
+  try { uploaded = await pushUploadedLeads(parsed_profile); } catch {}
   const lead_id = uploaded?.lead_id || uploaded?.id;
   if (lead_id) {
-    try { status = await pushLeadStatusUpdate(lead_id, parsed); } catch {}
+    try { status = await pushLeadStatusUpdate(lead_id, parsed_profile); } catch {}
   }
 
-  return { local_id: result.insertId, lead_data: parsed, admissions_uploadedLeads: uploaded, admissions_leadStatusUpdate: status };
+  return {
+    local_id: result.insertId,
+    lead_data: parsed_profile,
+    admissions_uploadedLeads: uploaded,
+    admissions_leadStatusUpdate: status
+  };
 }
 
 // ---------- API: manual OCR ----------
@@ -167,25 +206,18 @@ app.post("/ocr", async (req, res) => {
   }
 });
 
-// ---------- API: auto import from SOURCE_API ----------
+// ---------- API: auto import ----------
 app.get("/auto-import", async (req, res) => {
   try {
     if (!SOURCE_API) return res.status(400).json({ error: "SOURCE_API not set" });
 
-    // 🔹 POST request to SOURCE_API with auth
     const { data: forms } = await axios.post(
       SOURCE_API,
-      { status: "new" }, // adjust body if needed
-      {
-        headers: {
-          Authorization: `Bearer ${ADMISSIONS_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      }
+      { status: "new" },
+      { headers: { Authorization: `Bearer ${ADMISSIONS_TOKEN}`, "Content-Type": "application/json" } }
     );
 
     const results = [];
-    // Adjust if response is wrapped in { data: [] }
     const leads = Array.isArray(forms) ? forms : forms.data || [];
     for (const f of leads) {
       if (f.s3_url) {
@@ -200,7 +232,7 @@ app.get("/auto-import", async (req, res) => {
   }
 });
 
-// ---------- Scheduled automation (every hour) ----------
+// ---------- Scheduled automation ----------
 cron.schedule("0 * * * *", async () => {
   if (!SOURCE_API) return;
   console.log("Running scheduled import...");
@@ -208,12 +240,7 @@ cron.schedule("0 * * * *", async () => {
     const { data: forms } = await axios.post(
       SOURCE_API,
       { status: "new" },
-      {
-        headers: {
-          Authorization: `Bearer ${ADMISSIONS_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      }
+      { headers: { Authorization: `Bearer ${ADMISSIONS_TOKEN}`, "Content-Type": "application/json" } }
     );
     const leads = Array.isArray(forms) ? forms : forms.data || [];
     for (const f of leads) {
