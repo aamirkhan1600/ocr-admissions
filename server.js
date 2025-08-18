@@ -90,7 +90,16 @@ function after(text, labelRegex, valueRegex = /([^\n\r]+)/) {
   return m ? (m[1] || "").trim() : "";
 }
 
-// ✨ Improved parser for handwritten forms
+// ---------- Fix: sanitize before DB insert ----------
+function sanitizeForDb(obj) {
+  const clean = {};
+  for (const [k, v] of Object.entries(obj)) {
+    clean[k] = (v === undefined || v === "") ? null : v;
+  }
+  return clean;
+}
+
+// ---------- Improved Form Parser ----------
 function parseStudentForm(raw) {
   const text = raw.replace(/[|]+/g, " ").replace(/\u200b/g, "").replace(/\r/g, "");
 
@@ -174,8 +183,9 @@ async function processFormFromUrl(s3_url) {
   fs.unlink(imgPath, () => {});
   fs.unlink(procPath, () => {});
 
-  const parsed = parseStudentForm(text);
+  let parsed = parseStudentForm(text);
   parsed.image_url = s3_url;
+  parsed = sanitizeForDb(parsed); // <<< FIX applied here
 
   const sql = `INSERT INTO student_forms 
     (image_url, first_name, last_name, mobile_no, email, school_college_name, current_grade,
